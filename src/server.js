@@ -9,11 +9,12 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const Razorpay = require("razorpay");
-const { rateLimit } = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 const Message = require("./models/Message");
 const GhostId = require("./models/GhostId");
@@ -84,18 +85,27 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .map((v) => v.trim())
   .filter(Boolean);
 const redisUrl = String(process.env.REDIS_URL || "").trim();
-if (!redisUrl) {
-  throw new Error(
-    "Missing REDIS_URL configuration. Redis-backed rate limiting is required.",
+const useRedisRateLimit =
+  redisUrl && process.env.USE_REDIS_RATE_LIMIT === "true";
+let redisClient = null;
+if (useRedisRateLimit) {
+  redisClient = createClient({
+    url: redisUrl,
+    socket: {
+      reconnectStrategy: false,
+    },
+  });
+  redisClient.on("error", (error) => {
+    console.warn("Redis unavailable; rate limit checks will fall back:", error.message);
+  });
+  redisClient.connect().catch((error) => {
+    console.warn("Redis connection failed; continuing without Redis:", error.message);
+  });
+} else {
+  console.warn(
+    "Using in-memory rate limiting. Set USE_REDIS_RATE_LIMIT=true with REDIS_URL to enable Redis-backed limits.",
   );
 }
-const redisClient = createClient({ url: redisUrl });
-redisClient.on("error", (error) => {
-  console.error("Redis error:", error);
-});
-redisClient.connect().catch((error) => {
-  console.error("Redis connection failed:", error);
-});
 
 function isAllowedCorsOrigin(origin) {
   if (!origin) {
@@ -119,20 +129,19 @@ const io = socketIo(server, {
 });
 
 function makeRateLimiter({ windowMs, max, keyPrefix }) {
-  return rateLimit({
+  const options = {
     windowMs,
     max,
     standardHeaders: true,
     legacyHeaders: false,
+    passOnStoreError: true,
     keyGenerator: (req) => {
-      const ip = req.ip || req.connection?.remoteAddress || "unknown";
+      const ip = ipKeyGenerator(
+        req.ip || req.connection?.remoteAddress || "unknown",
+      );
       const userKey = req.auth?.chatId || req.params?.chatId || "anon";
       return `${keyPrefix}:${ip}:${userKey}`;
     },
-    store: new RedisStore({
-      sendCommand: (...args) => redisClient.sendCommand(args),
-      prefix: `rl:${keyPrefix}:`,
-    }),
     handler: (req, res) => {
       const retryAfter = Number(res.getHeader("Retry-After") || 60);
       res.status(429).json({
@@ -140,7 +149,16 @@ function makeRateLimiter({ windowMs, max, keyPrefix }) {
         retryAfterSeconds: retryAfter,
       });
     },
-  });
+  };
+
+  if (redisClient) {
+    options.store = new RedisStore({
+      sendCommand: (...args) => redisClient.sendCommand(args),
+      prefix: `rl:${keyPrefix}:`,
+    });
+  }
+
+  return rateLimit(options);
 }
 
 const createOrderRateLimiter = makeRateLimiter({
@@ -2179,7 +2197,7 @@ app.post("/groups/delete", async (req, res) => {
   }
 });
 
-app.get("/check-update", requireUpdateApiKey, (req, res) => {
+app.get("/check-update", (req, res) => {
   const cfg = readUpdateConfig();
   return res.json({
     latest_version: cfg.latest_version,
@@ -2324,13 +2342,20 @@ app.get("/messages/:user1/:user2", (req, res) => res.json([]));
 app.get("/messages/offline/:chatId/:deviceId", async (req, res) => {
   try {
     const { chatId, deviceId } = req.params;
-    const messages = await Message.find({
+    const query = {
       $or: [{ receiverChatId: chatId }, { senderChatId: chatId }],
       "payloads.deviceId": { $in: [deviceId, "all"] }
-    }).sort({ timestamp: 1 });
+    };
+    if (req.query.messageId) {
+      query.messageId = String(req.query.messageId);
+    }
+
+    const messages = await Message.find(query).sort({ timestamp: 1 });
 
     const formatted = messages.map(msg => {
-      const payload = msg.payloads.find(p => p.deviceId === deviceId);
+      const payload =
+        msg.payloads.find(p => p.deviceId === deviceId) ||
+        msg.payloads.find(p => p.deviceId === "all");
       return {
         messageId: msg.messageId,
         clientMessageId: msg.clientMessageId || null,
@@ -2338,8 +2363,18 @@ app.get("/messages/offline/:chatId/:deviceId", async (req, res) => {
         receiverChatId: msg.receiverChatId,
         groupId: msg.groupId || null,
         senderDeviceId: msg.senderDeviceId,
+        senderDevicePublicKey: msg.senderDevicePublicKey || null,
         timestamp: msg.timestamp,
         ghostSessionId: msg.ghostSessionId || null,
+        type: typeof msg.type === "number" ? msg.type : 0,
+        mediaUrl: msg.mediaUrl || null,
+        fileName: msg.fileName || null,
+        fileSize: typeof msg.fileSize === "number" ? msg.fileSize : null,
+        replyToId: msg.replyToId || null,
+        replyToContent: msg.replyToContent || null,
+        isViewOnce: Boolean(msg.isViewOnce),
+        isForwarded: Boolean(msg.isForwarded),
+        expiresAt: msg.expiresAt || null,
         payload
       };
     }).filter(m => m.payload != null);
@@ -2381,6 +2416,7 @@ app.post("/send", async (req, res) => {
       senderChatId,
       receiverChatId,
       senderDeviceId,
+      senderDevicePublicKey,
       payloads,
       groupId,
       timestamp,
@@ -2401,6 +2437,18 @@ app.post("/send", async (req, res) => {
     const senderRealId = normalizeChatId(senderChatId);
     if (!senderRealId) {
       return res.status(400).json({ error: "Invalid senderChatId" });
+    }
+
+    let resolvedSenderDevicePublicKey = senderDevicePublicKey
+      ? String(senderDevicePublicKey)
+      : null;
+    if (!resolvedSenderDevicePublicKey && senderDeviceId) {
+      const senderForKey = await User.findOne({ chatId: senderRealId }).select("devices");
+      const senderDevice = senderForKey?.devices?.find(
+        d => String(d.deviceId || "") === String(senderDeviceId)
+      );
+      resolvedSenderDevicePublicKey =
+        senderDevice?.encryptionPublicKey || null;
     }
 
     const now = new Date();
@@ -2436,6 +2484,7 @@ app.post("/send", async (req, res) => {
         senderChatId: senderPublicId,
         receiverChatId: resolvedReceiver,
         senderDeviceId,
+        senderDevicePublicKey: resolvedSenderDevicePublicKey,
         payloads,
         groupId: groupId ? normalizeChatId(groupId) : null,
         timestamp: timestamp || now,
@@ -2471,28 +2520,16 @@ app.post("/send", async (req, res) => {
       if (recipient && recipient.fcmToken) {
         const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
         if (!isOnline) {
-          const payload = {
+          sendDataOnlyPushNotification({
             token: recipient.fcmToken,
-            notification: {
-              title: `Message from ${senderPublicId}`,
-              body: "You have a new encrypted message",
-            },
-            data: {
-              type: "CHAT_MESSAGE",
-              senderChatId: String(senderPublicId),
-              messageId: String(messageId),
-              clientMessageId: clientMessageId ? String(clientMessageId) : "",
-              groupId: groupId ? String(groupId) : "",
-            },
-            android: {
-              priority: "high",
-              notification: {
-                channelId: "convoo_messages",
-                clickAction: "FLUTTER_NOTIFICATION_CLICK",
-              },
-            },
-          };
-          admin.messaging().send(payload).catch(e => console.error("FCM Error:", e));
+            senderId: senderPublicId,
+            senderName: senderPublicId,
+            type: typeof type === "number" ? type : 0,
+            messageId,
+            payloads,
+            groupId: groupId ? normalizeChatId(groupId) : null,
+            isGroup: Boolean(groupId),
+          });
         }
       }
 
@@ -2525,6 +2562,7 @@ app.post("/send", async (req, res) => {
       senderChatId: senderPublicId,
       receiverChatId: resolvedReceiver,
       senderDeviceId,
+      senderDevicePublicKey: resolvedSenderDevicePublicKey,
       payloads,
       groupId: groupId ? normalizeChatId(groupId) : null,
       timestamp: timestamp || now,
@@ -2559,28 +2597,16 @@ app.post("/send", async (req, res) => {
     if (recipient && recipient.fcmToken) {
       const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
       if (!isOnline) {
-        const payload = {
+        sendDataOnlyPushNotification({
           token: recipient.fcmToken,
-          notification: {
-            title: `Message from ${senderPublicId}`,
-            body: "You have a new encrypted message",
-          },
-          data: {
-            type: "CHAT_MESSAGE",
-            senderChatId: String(senderPublicId),
-            messageId: String(messageId),
-            clientMessageId: clientMessageId ? String(clientMessageId) : "",
-            groupId: groupId ? String(groupId) : "",
-          },
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "convoo_messages",
-              clickAction: "FLUTTER_NOTIFICATION_CLICK",
-            },
-          },
-        };
-        admin.messaging().send(payload).catch(e => console.error("FCM Error:", e));
+          senderId: senderPublicId,
+          senderName: senderPublicId,
+          type: typeof type === "number" ? type : 0,
+          messageId,
+          payloads,
+          groupId: groupId ? normalizeChatId(groupId) : null,
+          isGroup: Boolean(groupId),
+        });
       }
     }
 
@@ -3958,8 +3984,8 @@ function ensureRazorpayReady(res) {
 
 function validatePaymentConfigAtStartup() {
   if (!razorpayKeyId || !razorpayKeySecret) {
-    throw new Error(
-      "Missing Razorpay configuration. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.",
+    console.warn(
+      "Razorpay configuration is missing. Payment endpoints will return 503 until RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET are set.",
     );
   }
   if (!razorpayWebhookSecret) {
